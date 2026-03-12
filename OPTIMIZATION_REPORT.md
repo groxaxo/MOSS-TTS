@@ -229,3 +229,68 @@ export MOSS_TTS_COMPILE_BACKBONE=false
 
 5. **Multi-stream codec decode**: Overlap codec decoding with backbone
    generation using separate CUDA streams.
+
+---
+
+## RTX 3060 Deployment (2026-03-13 Update)
+
+### Goal
+Run the optimized server on an RTX 3060 (12 GB VRAM) alongside existing 3090 workloads.
+
+### VRAM Challenge & Fix
+
+| Component | float32 | bfloat16 | float16 |
+|-----------|---------|----------|---------|
+| MOSS-TTS-Realtime backbone | — | 4,400 MiB | — |
+| MOSS-Audio-Tokenizer codec | 6,860 MiB | ❌ unsupported¹ | 3,430 MiB |
+| **Total on 3060** | > 12 GB ❌ | — | **~9,200 MiB ✅** |
+
+¹ The codec's custom CUDA kernels raise "Got unsupported ScalarType BFloat16" — float16 is the only viable half-precision dtype.
+
+**Fix**: `_load_codec()` in `app.py` now explicitly loads the codec with `torch_dtype=torch.float16` and wraps it in `_BF16CodecWrapper` (autocast float16 context). The backbone remains in bfloat16.
+
+### Results on RTX 3060
+
+- **VRAM used**: 9,174 MiB / 12,288 MiB  
+- **Server startup**: ~90 seconds (model load + torch.compile + 2× warmup)
+- **Inference latency** (warm, SDPA + torch.compile):
+  - Short sentence (20 chars): ~1.8 s total
+  - Medium sentence (87 chars): ~3.0–4.7 s total
+- **Health check**: `GET /health` → `{"status":"ok","device":"cuda:0","attn_implementation":"sdpa"}`
+
+### Deployment Infrastructure
+
+**Shell launcher** (`start_moss_tts.sh` — default launch method):
+```bash
+./start_moss_tts.sh
+# or with overrides:
+MOSS_TTS_GPU=GPU-other MOSS_TTS_PORT=8013 ./start_moss_tts.sh
+```
+
+**Systemd service** (auto-start on boot):
+```bash
+sudo systemctl enable --now moss-tts.service
+sudo journalctl -u moss-tts -f
+```
+
+Service configuration (`/etc/systemd/system/moss-tts.service`):
+- GPU: `CUDA_VISIBLE_DEVICES=GPU-cbfc8a5f-0df1-ca71-f704-0d09a707d2ac` (RTX 3060)
+- All optimizations enabled: `MOSS_TTS_COMPILE_BACKBONE=true`, `MOSS_TTS_WARMUP_ON_START=true`
+- Restart on failure with 10s backoff, 300s startup timeout
+
+**API endpoint** (OpenAI-compatible):
+```
+POST http://0.0.0.0:8012/v1/audio/speech
+GET  http://0.0.0.0:8012/v1/audio/models
+GET  http://0.0.0.0:8012/v1/audio/voices
+GET  http://0.0.0.0:8012/health
+```
+
+### Git History
+
+| Commit | Description |
+|--------|-------------|
+| `6a89aff` | feat: RTX 3090 performance optimizations (flash_attn, torch.compile, SDPA, warmup) |
+| `2f0b604` | fix: use float16 for codec to support RTX 3060, add launcher script |
+
+Repository: https://github.com/groxaxo/MOSS-TTS
