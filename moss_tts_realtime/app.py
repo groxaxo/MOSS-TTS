@@ -24,7 +24,8 @@ from mossttsrealtime.streaming_mossttsrealtime import (
     MossTTSRealtimeStreamingSession,
 )
 
-torch._dynamo.config.cache_size_limit = 64
+torch._dynamo.config.cache_size_limit = 128
+torch._dynamo.config.suppress_errors = True
 
 APP_DIR = Path(__file__).resolve().parent
 AUDIO_DIR = APP_DIR / "audio"
@@ -52,6 +53,23 @@ def _apply_seed(seed: int | None) -> None:
         return
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+def _configure_cuda_runtime() -> None:
+    if not torch.cuda.is_available():
+        return
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    # Pre-allocate CUDA memory pool to reduce allocation overhead during inference
+    torch.cuda.empty_cache()
+    # Enable CUDA memory-efficient allocator settings
+    if hasattr(torch.cuda, "memory"):
+        try:
+            torch.cuda.memory.set_per_process_memory_fraction(0.95)
+        except Exception:
+            pass
 
 
 def _load_audio(path: Path, target_sample_rate: int = SAMPLE_RATE) -> torch.Tensor:
@@ -417,6 +435,7 @@ def _load_backend(
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the MossTTSRealtime streaming demo.")
 
+    _configure_cuda_runtime()
     device = torch.device(device_str)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     processor = MossTTSRealtimeProcessor(tokenizer)
@@ -433,6 +452,22 @@ def _load_backend(
     else:
         model = MossTTSRealtime.from_pretrained(model_path, torch_dtype=dtype).to(device)
     model.eval()
+
+    # Compile the backbone language model for faster autoregressive decode.
+    # Use default mode (Triton kernel fusion) with dynamic=True to handle
+    # varying KV cache / sequence lengths without shape-triggered recompilation.
+    import os as _os
+    if _os.getenv("MOSS_TTS_COMPILE_BACKBONE", "true").lower() not in ("0", "false", "no"):
+        try:
+            model.language_model = torch.compile(
+                model.language_model,
+                mode="default",
+                fullgraph=False,
+                dynamic=True,
+            )
+        except Exception as _e:
+            import logging as _logging
+            _logging.getLogger(__name__).warning("Backbone torch.compile failed (non-fatal): %s", _e)
 
     codec = _load_codec(device, codec_model_path)
     return model, tokenizer, processor, codec, device

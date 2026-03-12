@@ -198,6 +198,31 @@ Notes:
 - If FlashAttention 2 fails to build on your machine, you can skip it and use the default attention backend.
 - FlashAttention 2 is only available on supported GPUs and is typically used with `torch.float16` or `torch.bfloat16`.
 
+#### OpenAI-compatible FastAPI server for Open WebUI
+
+The realtime model now includes a FastAPI server with OpenAI-style TTS endpoints:
+
+```bash
+conda activate moss-tts
+cd MOSS-TTS
+MOSS_TTS_DEVICE=cuda:0 moss-tts-realtime-openai
+```
+
+Available routes:
+
+- `POST /v1/audio/speech`
+- `GET /v1/audio/models`
+- `GET /v1/audio/voices`
+
+Compatibility aliases are also exposed at `/audio/speech`, `/audio/models`, and `/audio/voices`.
+
+For Open WebUI, point the custom TTS OpenAI base URL to either:
+
+- `http://<host>:8012/v1`
+- `http://<host>:8012`
+
+The server reuses the MOSS-TTS-Realtime streaming backend, caches bundled prompt voices, and auto-selects the best available attention backend (`flash_attention_2` on supported Ampere GPUs when `flash-attn` is installed, otherwise `sdpa`).
+
 
 <a id="moss-tts-basic-usage"></a>
 ### MOSS‑TTS Basic Usage

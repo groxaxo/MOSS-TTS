@@ -77,6 +77,7 @@ llama-cpp-torch = [
 
 [project.scripts]
 moss-tts-llama-cpp = "moss_tts_delay.llama_cpp.pipeline:main"
+moss-tts-realtime-openai = "moss_tts_realtime.openai_api:main"
 
 [project.urls]
 Homepage = "https://github.com/OpenMOSS-Team/MOSS-TTS"
@@ -84,3 +85,13 @@ Repository = "https://github.com/OpenMOSS-Team/MOSS-TTS"
 
 [tool.setuptools]
 py-modules = []
+
+[tool.setuptools.packages.find]
+include = [
+  "moss_tts_delay",
+  "moss_tts_local",
+  "moss_tts_realtime",
+  "moss_tts_realtime.*",
+  "mossttsrealtime",
+  "mossttsrealtime.*",
+]

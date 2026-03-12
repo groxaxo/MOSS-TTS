@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+from collections import deque
 from typing import Iterable, Iterator, List, Optional, Sequence
 
 import numpy as np
@@ -62,27 +63,23 @@ class MossTTSRealtimeInference:
 
         self.past_key_values = None
         self.attention_mask = None
-        self._generated_tokens: List[torch.Tensor] = []
+        self._recent_generated_tokens: deque[torch.Tensor] = deque()
+        self._recent_generated_limit = 0
         self._is_stopping = None
         self._last_audio_tokens = None
         self._step_idx = 0
-        attn_impl = ""
-        for cfg in (
-            getattr(getattr(self.model, "local_transformer", None), "config", None),
-            getattr(getattr(self.model, "config", None), "local_config", None),
-            getattr(self.model, "config", None),
-        ):
-            if cfg is None:
-                continue
-            for name in ("_attn_implementation", "attn_implementation"):
-                candidate = getattr(cfg, name, None)
-                if isinstance(candidate, str) and candidate.strip():
-                    attn_impl = candidate.strip().lower()
-                    break
-            if attn_impl:
-                break
-        self._use_dynamic_local_cache = attn_impl == "flash_attention_2"
-        self._should_compile_local_transformer = not self._use_dynamic_local_cache
+
+        # Force local transformer to use StaticCache + torch.compile regardless
+        # of backbone attention implementation. The local transformer processes
+        # only 16-token RVQ sequences where flash_attn has negligible benefit,
+        # but StaticCache + compile gives significant speedup via CUDA graphs.
+        local_cfg = getattr(self.model.local_transformer, "config", None)
+        if local_cfg is not None:
+            for attr in ("_attn_implementation", "attn_implementation"):
+                if hasattr(local_cfg, attr):
+                    setattr(local_cfg, attr, "sdpa")
+        self._use_dynamic_local_cache = False
+        self._should_compile_local_transformer = True
         self._compiled_local_transformer = None
 
     @property
@@ -105,13 +102,34 @@ class MossTTSRealtimeInference:
             self._compiled_local_transformer = torch.compile(self._generate_local_transformer_impl, fullgraph=True)
         return self._compiled_local_transformer
 
+    def _set_recent_generated_limit(self, repetition_window: Optional[int]) -> None:
+        limit = max(0, int(repetition_window or 0))
+        if limit == self._recent_generated_limit:
+            return
+        current = list(self._recent_generated_tokens)
+        if limit == 0:
+            self._recent_generated_tokens = deque()
+        else:
+            self._recent_generated_tokens = deque(current[-limit:], maxlen=limit)
+        self._recent_generated_limit = limit
+
+    def _record_generated_tokens(self, audio_tokens: torch.Tensor) -> None:
+        if self._recent_generated_limit > 0:
+            self._recent_generated_tokens.append(audio_tokens)
+
+    def _get_recent_generated_history(self) -> Optional[torch.Tensor]:
+        if not self._recent_generated_tokens:
+            return None
+        return torch.stack(tuple(self._recent_generated_tokens), dim=1)
+
     def reset_generation_state(self, keep_cache: bool = True):
         if not keep_cache:
             self.past_key_values = None
             self.attention_mask = None
         # Keep the mask when reusing cache so it stays aligned with past_key_values.
         # This allows concatenation with the next turn prefill mask.
-        self._generated_tokens = []
+        self._recent_generated_tokens = deque()
+        self._recent_generated_limit = 0
         self._is_stopping = None
         self._last_audio_tokens = None
         self._step_idx = 0
@@ -166,6 +184,7 @@ class MossTTSRealtimeInference:
     ) -> torch.Tensor:
         if device is None:
             device = self.device
+        self._set_recent_generated_limit(repetition_window)
 
         if past_key_values is not None:
             self.past_key_values = past_key_values
@@ -231,7 +250,7 @@ class MossTTSRealtimeInference:
             gen_step=0,
         )
 
-        self._generated_tokens = [audio_tokens]
+        self._record_generated_tokens(audio_tokens)
         self._last_audio_tokens = audio_tokens
         self._is_stopping = audio_tokens[:, 0] == self.audio_eos_token
         self._step_idx = 1
@@ -267,6 +286,7 @@ class MossTTSRealtimeInference:
             raise ValueError(f"text_token batch size mismatch: got {len(text_tokens)}, expected {batch_size}.")
 
         device = self._last_audio_tokens.device
+        self._set_recent_generated_limit(repetition_window)
         text_t = torch.tensor(text_tokens, device=device, dtype=torch.long)
         step_ids = torch.cat([text_t[:, None, None], self._last_audio_tokens.unsqueeze(1)], dim=2)
         self.attention_mask = torch.cat([self.attention_mask, (~self._is_stopping).unsqueeze(-1)], dim=-1)
@@ -281,7 +301,7 @@ class MossTTSRealtimeInference:
         self.past_key_values = outputs.past_key_values
         backbone_hidden_states = outputs.last_hidden_state[:, -1:, :]
 
-        history = torch.stack(self._generated_tokens, dim=1) if self._generated_tokens else None
+        history = self._get_recent_generated_history()
         audio_tokens = self.generate_local_transformer(
             hidden_states=backbone_hidden_states,
             temperature=temperature,
@@ -294,7 +314,7 @@ class MossTTSRealtimeInference:
             gen_step=self._step_idx,
         )
 
-        self._generated_tokens.append(audio_tokens)
+        self._record_generated_tokens(audio_tokens)
         self._last_audio_tokens = audio_tokens
         self._is_stopping |= audio_tokens[:, 0] == self.audio_eos_token
         self._step_idx += 1
@@ -523,7 +543,7 @@ class MossTTSRealtimeStreamingSession:
         self._turn_idx = 0
 
         self._text_cache = ""
-        self._pending_tokens: list[int] = []
+        self._pending_tokens: deque[int] = deque()
         self._prefilled = False
         self._text_ended = False
 
@@ -609,7 +629,7 @@ class MossTTSRealtimeStreamingSession:
         self._turn_idx += 1
 
         self._text_cache = ""
-        self._pending_tokens = []
+        self._pending_tokens.clear()
         self._prefilled = False
         self._text_ended = False
 
@@ -693,7 +713,7 @@ class MossTTSRealtimeStreamingSession:
         if prefill_len == 0:
             return []
 
-        prefix_tokens = [self._pending_tokens.pop(0) for _ in range(prefill_len)]
+        prefix_tokens = [self._pending_tokens.popleft() for _ in range(prefill_len)]
         audio_tokens = self.inferencer.prefill(
             input_ids=[self._turn_input_ids],
             text_prefix_ids=[prefix_tokens],
@@ -714,7 +734,7 @@ class MossTTSRealtimeStreamingSession:
             return outputs
 
         while self._pending_tokens and not self.inferencer.is_finished:
-            token = self._pending_tokens.pop(0)
+            token = self._pending_tokens.popleft()
             outputs.append(
                 self.inferencer.step(
                     token,

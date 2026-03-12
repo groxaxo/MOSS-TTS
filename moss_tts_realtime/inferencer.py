@@ -84,7 +84,15 @@ class MossTTSRealtimeInference:
         self.codec = codec
         self.codec_sample_rate = int(codec_sample_rate)
         self.codec_encode_kwargs = codec_encode_kwargs or {"chunk_duration": 8}
-        self._use_dynamic_local_cache = self.model.config._attn_implementation == "flash_attention_2"
+        # Force local transformer to use StaticCache + torch.compile (see streaming_mossttsrealtime.py)
+        local_cfg = getattr(self.model.local_transformer, "config", None)
+        if local_cfg is not None:
+            for attr in ("_attn_implementation", "attn_implementation"):
+                if hasattr(local_cfg, attr):
+                    setattr(local_cfg, attr, "sdpa")
+        self._use_dynamic_local_cache = False
+        self._should_compile_local_transformer = True
+        self._compiled_local_transformer = None
 
     @property
     def device(self) -> torch.device:
@@ -94,6 +102,13 @@ class MossTTSRealtimeInference:
         if self._use_dynamic_local_cache:
             return DynamicCache()
         return StaticCache(config=self.model.local_transformer.config, max_cache_len=self.channels)
+
+    def _get_local_transformer_runner(self):
+        if not self._should_compile_local_transformer:
+            return self._generate_local_transformer_impl
+        if self._compiled_local_transformer is None:
+            self._compiled_local_transformer = torch.compile(self._generate_local_transformer_impl, fullgraph=True)
+        return self._compiled_local_transformer
 
     def _load_audio(self, audio_path: str, target_sample_rate: int) -> torch.Tensor:
         wav, sr = torchaudio.load(audio_path)
@@ -352,6 +367,31 @@ class MossTTSRealtimeInference:
         )
 
     def generate_local_transformer(
+        self,
+        hidden_states: torch.Tensor,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+        do_sample: bool,
+        repetition_penalty: Optional[float],
+        repetition_window: Optional[int],
+        generated_tokens: Optional[torch.Tensor],
+        gen_step: int,
+    ) -> torch.Tensor:
+        runner = self._get_local_transformer_runner()
+        return runner(
+            hidden_states=hidden_states,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+            repetition_window=repetition_window,
+            generated_tokens=generated_tokens,
+            gen_step=gen_step,
+        )
+
+    def _generate_local_transformer_impl(
         self,
         hidden_states: torch.Tensor,
         temperature: float,
