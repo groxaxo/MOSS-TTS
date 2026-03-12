@@ -81,9 +81,57 @@ def _load_audio(path: Path, target_sample_rate: int = SAMPLE_RATE) -> torch.Tens
     return wav
 
 
+class _BF16CodecWrapper:
+    """Thin wrapper that loads codec weights in float16 (halves VRAM vs float32) and
+    uses torch.autocast so float32 inputs are silently cast at each op.
+    Note: float16 is used (not bfloat16) because the codec's custom CUDA kernels
+    do not support bfloat16.
+    Forwards every attribute / call to the underlying codec model."""
+
+    def __init__(self, codec, dtype: torch.dtype):
+        object.__setattr__(self, "_codec", codec)
+        object.__setattr__(self, "_dtype", dtype)
+        object.__setattr__(self, "device", next(codec.parameters()).device)
+
+    def _autocast_ctx(self):
+        dev = object.__getattribute__(self, "device")
+        dtype = object.__getattribute__(self, "_dtype")
+        if dev.type == "cuda":
+            return torch.amp.autocast("cuda", dtype=dtype)
+        return torch.amp.autocast("cpu", dtype=dtype)
+
+    def encode(self, *args, **kwargs):
+        with self._autocast_ctx():
+            return object.__getattribute__(self, "_codec").encode(*args, **kwargs)
+
+    def decode(self, *args, **kwargs):
+        with self._autocast_ctx():
+            return object.__getattribute__(self, "_codec").decode(*args, **kwargs)
+
+    def streaming(self, *args, **kwargs):
+        return object.__getattribute__(self, "_codec").streaming(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_codec"), name)
+
+    def __call__(self, *args, **kwargs):
+        with self._autocast_ctx():
+            return object.__getattribute__(self, "_codec")(*args, **kwargs)
+
+    def parameters(self):
+        return object.__getattribute__(self, "_codec").parameters()
+
+
 def _load_codec(device: torch.device, codec_model_path: str):
-    codec = AutoModel.from_pretrained(codec_model_path, trust_remote_code=True).eval()
-    return codec.to(device)
+    # Load codec weights in float16 to halve VRAM (~6.7 GB float32 → ~3.4 GB).
+    # float16 is used instead of bfloat16 because the codec's custom CUDA kernels
+    # only support float32 and float16 — bfloat16 raises "Got unsupported ScalarType BFloat16".
+    # The _BF16CodecWrapper applies torch.autocast so float32 runtime tensors
+    # are transparently cast at each op without touching caller code.
+    dtype = torch.float16
+    codec = AutoModel.from_pretrained(codec_model_path, trust_remote_code=True, torch_dtype=dtype).eval()
+    codec = codec.to(device)
+    return _BF16CodecWrapper(codec, dtype)
 
 
 def _extract_codes(encode_result):
